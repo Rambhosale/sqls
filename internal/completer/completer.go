@@ -7,14 +7,14 @@ import (
 	"regexp"
 	"strings"
 
-	"github.com/lighttiger2505/sqls/ast"
-	"github.com/lighttiger2505/sqls/ast/astutil"
-	"github.com/lighttiger2505/sqls/dialect"
-	"github.com/lighttiger2505/sqls/internal/database"
-	"github.com/lighttiger2505/sqls/internal/lsp"
-	"github.com/lighttiger2505/sqls/parser"
-	"github.com/lighttiger2505/sqls/parser/parseutil"
-	"github.com/lighttiger2505/sqls/token"
+	"github.com/sqls-server/sqls/ast"
+	"github.com/sqls-server/sqls/ast/astutil"
+	"github.com/sqls-server/sqls/dialect"
+	"github.com/sqls-server/sqls/internal/database"
+	"github.com/sqls-server/sqls/internal/lsp"
+	"github.com/sqls-server/sqls/parser"
+	"github.com/sqls-server/sqls/parser/parseutil"
+	"github.com/sqls-server/sqls/token"
 )
 
 type completionType int
@@ -32,6 +32,8 @@ const (
 	CompletionTypeChange
 	CompletionTypeUser
 	CompletionTypeSchema
+	CompletionTypeJoin
+	CompletionTypeJoinOn
 )
 
 func (ct completionType) String() string {
@@ -54,6 +56,14 @@ func (ct completionType) String() string {
 		return "User"
 	case CompletionTypeSchema:
 		return "Schema"
+	case CompletionTypeSubQuery:
+		return "SubQuery"
+	case CompletionTypeSubQueryColumn:
+		return "SubQueryColumn"
+	case CompletionTypeJoin:
+		return "Join clause"
+	case CompletionTypeJoinOn:
+		return "Join On condition"
 	default:
 		return ""
 	}
@@ -100,7 +110,7 @@ func (c *Completer) Complete(text string, params lsp.CompletionParams, lowercase
 	if err != nil {
 		return nil, err
 	}
-	definedSubQuerys, err := parseutil.ExtractSubQueryViews(parsed, pos)
+	definedSubQueries, err := parseutil.ExtractSubQueryViews(parsed, pos)
 	if err != nil {
 		return nil, err
 	}
@@ -108,7 +118,7 @@ func (c *Completer) Complete(text string, params lsp.CompletionParams, lowercase
 	lastWord := getLastWord(text, params.Position.Line+1, params.Position.Character)
 	withBackQuote := strings.HasPrefix(lastWord, "`")
 
-	items := []lsp.CompletionItem{}
+	var items []lsp.CompletionItem
 
 	if c.DBCache != nil {
 		if completionTypeIs(ctx.types, CompletionTypeColumn) {
@@ -126,7 +136,11 @@ func (c *Completer) Complete(text string, params lsp.CompletionParams, lowercase
 			items = append(items, candidates...)
 		}
 		if completionTypeIs(ctx.types, CompletionTypeTable) {
-			candidates := c.TableCandidates(ctx.parent, definedTables)
+			excl := definedTables
+			if completionTypeIs(ctx.types, CompletionTypeJoin) {
+				excl = nil
+			}
+			candidates := c.TableCandidates(ctx.parent, excl)
 			if withBackQuote {
 				candidates = toQuotedCandidates(candidates)
 			}
@@ -140,18 +154,34 @@ func (c *Completer) Complete(text string, params lsp.CompletionParams, lowercase
 			items = append(items, candidates...)
 		}
 		if completionTypeIs(ctx.types, CompletionTypeSubQuery) {
-			candidates := c.SubQueryCandidates(definedSubQuerys)
+			candidates := c.SubQueryCandidates(definedSubQueries)
 			if withBackQuote {
 				candidates = toQuotedCandidates(candidates)
 			}
 			items = append(items, candidates...)
 		}
 		if completionTypeIs(ctx.types, CompletionTypeSubQueryColumn) {
-			candidates := c.SubQueryColumnCandidates(definedSubQuerys)
+			candidates := c.SubQueryColumnCandidates(definedSubQueries)
 			if withBackQuote {
 				candidates = toQuotedCandidates(candidates)
 			}
 			items = append(items, candidates...)
+		}
+		joinOn := completionTypeIs(ctx.types, CompletionTypeJoinOn)
+		if completionTypeIs(ctx.types, CompletionTypeJoin) || joinOn {
+			table, err := parseutil.ExtractLastTable(parsed, pos)
+			if err != nil {
+				return nil, err
+			}
+			tables, err := parseutil.ExtractPrevTables(parsed, pos)
+			if err != nil {
+				return nil, err
+			}
+			candidates := c.joinCandidates(table, tables, definedTables, joinOn, lowercaseKeywords)
+			if withBackQuote {
+				candidates = toQuotedCandidates(candidates) // what to do here?
+			}
+			items = append(candidates, items...)
 		}
 	}
 
@@ -181,10 +211,41 @@ func populateSortText(items []lsp.CompletionItem) {
 // This prefix defines the alphabetic priority of each kind.
 func getSortTextPrefix(kind lsp.CompletionItemKind) string {
 	switch kind {
+	case lsp.SnippetCompletion:
+		return "00"
 	case lsp.FieldCompletion:
 		return "0"
+	case lsp.ClassCompletion:
+		return "1"
+	case lsp.ModuleCompletion:
+		return "2"
+	case lsp.FunctionCompletion:
+		return "10"
+	case
+		lsp.ColorCompletion,
+		lsp.ConstantCompletion,
+		lsp.ConstructorCompletion,
+		lsp.EnumCompletion,
+		lsp.EnumMemberCompletion,
+		lsp.EventCompletion,
+		lsp.FileCompletion,
+		lsp.FolderCompletion,
+		lsp.InterfaceCompletion,
+		lsp.KeywordCompletion,
+		lsp.MethodCompletion,
+		lsp.OperatorCompletion,
+		lsp.PropertyCompletion,
+		lsp.ReferenceCompletion,
+		lsp.StructCompletion,
+		lsp.TextCompletion,
+		lsp.TypeParameterCompletion,
+		lsp.UnitCompletion,
+		lsp.ValueCompletion,
+		lsp.VariableCompletion:
+		return "9999"
+	default:
+		return "9999"
 	}
-	return "9"
 }
 
 type ParentType int
@@ -211,17 +272,17 @@ type CompletionContext struct {
 
 func getCompletionTypes(nw *parseutil.NodeWalker) *CompletionContext {
 	memberIdentifierMatcher := astutil.NodeMatcher{
-		NodeTypes: []ast.NodeType{ast.TypeMemberIdentifer},
+		NodeTypes: []ast.NodeType{ast.TypeMemberIdentifier},
 	}
 
 	syntaxPos := parseutil.CheckSyntaxPosition(nw)
-	t := []completionType{}
+	var t []completionType
 	p := noneParent
 	switch {
 	case syntaxPos == parseutil.ColName:
 		if nw.CurNodeIs(memberIdentifierMatcher) {
 			// has parent
-			mi := nw.CurNodeTopMatched(memberIdentifierMatcher).(*ast.MemberIdentifer)
+			mi := nw.CurNodeTopMatched(memberIdentifierMatcher).(*ast.MemberIdentifier)
 			t = []completionType{
 				CompletionTypeColumn,
 				CompletionTypeSubQueryColumn,
@@ -248,7 +309,7 @@ func getCompletionTypes(nw *parseutil.NodeWalker) *CompletionContext {
 	case syntaxPos == parseutil.SelectExpr || syntaxPos == parseutil.CaseValue:
 		if nw.CurNodeIs(memberIdentifierMatcher) {
 			// has parent
-			mi := nw.CurNodeTopMatched(memberIdentifierMatcher).(*ast.MemberIdentifer)
+			mi := nw.CurNodeTopMatched(memberIdentifierMatcher).(*ast.MemberIdentifier)
 			t = []completionType{
 				CompletionTypeColumn,
 				CompletionTypeView,
@@ -256,7 +317,7 @@ func getCompletionTypes(nw *parseutil.NodeWalker) *CompletionContext {
 			}
 			p = &completionParent{
 				Type: ParentTypeTable,
-				Name: mi.ParentTok.NoQuateString(),
+				Name: mi.ParentTok.NoQuoteString(),
 			}
 		} else {
 			t = []completionType{
@@ -272,7 +333,7 @@ func getCompletionTypes(nw *parseutil.NodeWalker) *CompletionContext {
 	case syntaxPos == parseutil.TableReference:
 		if nw.CurNodeIs(memberIdentifierMatcher) {
 			// has parent
-			mi := nw.CurNodeTopMatched(memberIdentifierMatcher).(*ast.MemberIdentifer)
+			mi := nw.CurNodeTopMatched(memberIdentifierMatcher).(*ast.MemberIdentifier)
 			t = []completionType{
 				CompletionTypeTable,
 				CompletionTypeView,
@@ -280,7 +341,7 @@ func getCompletionTypes(nw *parseutil.NodeWalker) *CompletionContext {
 			}
 			p = &completionParent{
 				Type: ParentTypeSchema,
-				Name: mi.ParentTok.NoQuateString(),
+				Name: mi.ParentTok.NoQuoteString(),
 			}
 		} else {
 			t = []completionType{
@@ -294,7 +355,7 @@ func getCompletionTypes(nw *parseutil.NodeWalker) *CompletionContext {
 	case syntaxPos == parseutil.WhereCondition:
 		if nw.CurNodeIs(memberIdentifierMatcher) {
 			// has parent
-			mi := nw.CurNodeTopMatched(memberIdentifierMatcher).(*ast.MemberIdentifer)
+			mi := nw.CurNodeTopMatched(memberIdentifierMatcher).(*ast.MemberIdentifier)
 			t = []completionType{
 				CompletionTypeColumn,
 				CompletionTypeView,
@@ -302,7 +363,7 @@ func getCompletionTypes(nw *parseutil.NodeWalker) *CompletionContext {
 			}
 			p = &completionParent{
 				Type: ParentTypeTable,
-				Name: mi.ParentTok.NoQuateString(),
+				Name: mi.ParentTok.NoQuoteString(),
 			}
 		} else {
 			t = []completionType{
@@ -314,6 +375,23 @@ func getCompletionTypes(nw *parseutil.NodeWalker) *CompletionContext {
 				CompletionTypeSubQuery,
 				CompletionTypeFunction,
 			}
+		}
+	case syntaxPos == parseutil.JoinClause:
+		t = []completionType{
+			CompletionTypeJoin,
+			CompletionTypeTable,
+			CompletionTypeReferencedTable,
+			CompletionTypeSchema,
+			CompletionTypeView,
+			CompletionTypeSubQuery,
+		}
+	case syntaxPos == parseutil.JoinOn:
+		t = []completionType{
+			CompletionTypeJoinOn,
+			CompletionTypeColumn,
+			CompletionTypeReferencedTable,
+			CompletionTypeSubQueryColumn,
+			CompletionTypeSubQuery,
 		}
 	case syntaxPos == parseutil.InsertColumn:
 		t = []completionType{
@@ -332,13 +410,13 @@ func getCompletionTypes(nw *parseutil.NodeWalker) *CompletionContext {
 }
 
 func filterCandidates(candidates []lsp.CompletionItem, lastWord string) []lsp.CompletionItem {
-	filterd := []lsp.CompletionItem{}
+	filtered := []lsp.CompletionItem{}
 	for _, candidate := range candidates {
 		if strings.HasPrefix(strings.ToUpper(candidate.Label), strings.ToUpper(lastWord)) {
-			filterd = append(filterd, candidate)
+			filtered = append(filtered, candidate)
 		}
 	}
-	return filterd
+	return filtered
 }
 
 func getLine(text string, line int) string {
