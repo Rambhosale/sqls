@@ -1,6 +1,7 @@
 package database
 
 import (
+	"os"
 	"context"
 	"database/sql"
 	"fmt"
@@ -9,7 +10,9 @@ import (
 	"strconv"
 
 	_ "github.com/denisenkom/go-mssqldb"
-	"github.com/lighttiger2505/sqls/dialect"
+	"github.com/sqls-server/sqls/dialect"
+	"github.com/jfcote87/sshdb"
+	"github.com/jfcote87/sshdb/mssql"
 	"golang.org/x/crypto/ssh"
 )
 
@@ -21,7 +24,6 @@ func init() {
 func mssqlOpen(dbConnCfg *DBConfig) (*DBConnection, error) {
 	var (
 		conn    *sql.DB
-		sshConn *ssh.Client
 	)
 	dsn, err := genMssqlConfig(dbConnCfg)
 	if err != nil {
@@ -29,13 +31,44 @@ func mssqlOpen(dbConnCfg *DBConfig) (*DBConnection, error) {
 	}
 
 	if dbConnCfg.SSHCfg != nil {
-		return nil, fmt.Errorf("connect via SSH is not supported")
+		key, err := os.ReadFile(dbConnCfg.SSHCfg.PrivateKey)
+		if err != nil {
+			return nil, fmt.Errorf("unable to open private key")
+		}
+
+		signer, err := ssh.ParsePrivateKeyWithPassphrase(key, []byte(dbConnCfg.SSHCfg.PassPhrase))
+		if err != nil {
+			return nil, fmt.Errorf("unable to decrypt private key")
+		}
+
+		cfg := &ssh.ClientConfig {
+			User: dbConnCfg.SSHCfg.User,
+			Auth: []ssh.AuthMethod {
+				ssh.PublicKeys(signer),
+			},
+			HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+		}
+
+		remoteAddr := fmt.Sprintf("%s:%d", dbConnCfg.SSHCfg.Host, dbConnCfg.SSHCfg.Port)
+
+		tunnel, err := sshdb.New(cfg, remoteAddr)
+		if err != nil {
+			return nil, fmt.Errorf("%w", err)
+		}
+
+		connector, err := tunnel.OpenConnector(mssql.TunnelDriver, dsn)
+		if err != nil {
+			return nil, err
+		}
+
+		conn = sql.OpenDB(connector)
+	} else {
+		conn, err = sql.Open("mssql", dsn)
+		if err != nil {
+			return nil, err
+		}
 	}
-	dbConn, err := sql.Open("sqlserver", dsn)
-	if err != nil {
-		return nil, err
-	}
-	conn = dbConn
+
 	if err = conn.Ping(); err != nil {
 		return nil, err
 	}
@@ -45,7 +78,6 @@ func mssqlOpen(dbConnCfg *DBConfig) (*DBConnection, error) {
 
 	return &DBConnection{
 		Conn:    conn,
-		SSHConn: sshConn,
 	}, nil
 }
 
@@ -107,7 +139,7 @@ func (db *MssqlDBRepository) Schemas(ctx context.Context) ([]string, error) {
 	rows, err := db.Conn.QueryContext(
 		ctx,
 		`
-	SELECT schema_name FROM information_schema.schemata
+	SELECT SCHEMA_NAME FROM INFORMATION_SCHEMA.SCHEMATA
 	`)
 	if err != nil {
 		log.Fatal(err)
@@ -129,13 +161,13 @@ func (db *MssqlDBRepository) SchemaTables(ctx context.Context) (map[string][]str
 		ctx,
 		`
 	SELECT
-		table_schema,
-		table_name
+		TABLE_SCHEMA,
+		TABLE_NAME
 	FROM
-		information_schema.tables
+		INFORMATION_SCHEMA.TABLES
 	ORDER BY
-		table_schema,
-		table_name
+		TABLE_SCHEMA,
+		TABLE_NAME
 	`)
 	if err != nil {
 		return nil, err
@@ -162,14 +194,14 @@ func (db *MssqlDBRepository) Tables(ctx context.Context) ([]string, error) {
 		ctx,
 		`
 	SELECT
-	  table_name
+	  TABLE_NAME
 	FROM
-	  information_schema.tables
+	  INFORMATION_SCHEMA.TABLES
 	WHERE
-	  table_type = 'BASE TABLE'
-	  AND table_schema NOT IN ('information_schema')
+	  TABLE_TYPE = 'BASE TABLE'
+	  AND TABLE_SCHEMA NOT IN ('INFORMATION_SCHEMA', 'information_schema')
 	ORDER BY
-	  table_name
+	  TABLE_NAME
 	`)
 	if err != nil {
 		log.Fatal(err)
@@ -191,31 +223,31 @@ func (db *MssqlDBRepository) DescribeDatabaseTable(ctx context.Context) ([]*Colu
 		ctx,
 		`
 	SELECT
-		c.table_schema,
-		c.table_name,
-		c.column_name,
-		c.data_type,
-		c.is_nullable,
-		CASE tc.constraint_type
+		c.TABLE_SCHEMA,
+		c.TABLE_NAME,
+		c.COLUMN_NAME,
+		c.DATA_TYPE,
+		c.IS_NULLABLE,
+		CASE tc.CONSTRAINT_TYPE
 			WHEN 'PRIMARY KEY' THEN 'YES'
 			ELSE 'NO'
 		END,
-		c.column_default,
+		c.COLUMN_DEFAULT,
 		''
 	FROM
-		information_schema.columns c
+		INFORMATION_SCHEMA.COLUMNS c
 	LEFT JOIN
-		information_schema.constraint_column_usage ccu
-		ON c.table_name = ccu.table_name
-		AND c.column_name = ccu.column_name
-	LEFT JOIN information_schema.table_constraints tc ON
-		tc.table_catalog = c.table_catalog
-		AND tc.table_schema = c.table_schema
-		AND tc.table_name = c.table_name
-		AND tc.constraint_name = ccu.constraint_name
+		INFORMATION_SCHEMA.CONSTRAINT_COLUMN_USAGE ccu
+		ON c.TABLE_NAME = ccu.TABLE_NAME
+		AND c.COLUMN_NAME = ccu.COLUMN_NAME
+	LEFT JOIN INFORMATION_SCHEMA.TABLE_CONSTRAINTS tc ON
+		tc.TABLE_CATALOG = c.TABLE_CATALOG
+		AND tc.TABLE_SCHEMA = c.TABLE_SCHEMA
+		AND tc.TABLE_NAME = c.TABLE_NAME
+		AND tc.CONSTRAINT_NAME = ccu.CONSTRAINT_NAME
 	ORDER BY
-		c.table_name,
-		c.ordinal_position
+		c.TABLE_NAME,
+		c.ORDINAL_POSITION
 	`)
 	if err != nil {
 		log.Fatal(err)
@@ -247,33 +279,33 @@ func (db *MssqlDBRepository) DescribeDatabaseTableBySchema(ctx context.Context, 
 		ctx,
 		`
 	SELECT
-		c.table_schema,
-		c.table_name,
-		c.column_name,
-		c.data_type,
-		c.is_nullable,
-		CASE tc.constraint_type
+		c.TABLE_SCHEMA,
+		c.TABLE_NAME,
+		c.COLUMN_NAME,
+		c.DATA_TYPE,
+		c.IS_NULLABLE,
+		CASE tc.CONSTRAINT_TYPE
 			WHEN 'PRIMARY KEY' THEN 'YES'
 			ELSE 'NO'
 		END,
-		c.column_default,
+		c.COLUMN_DEFAULT,
 		''
 	FROM
-		information_schema.columns c
+		INFORMATION_SCHEMA.COLUMNS c
 	LEFT JOIN
-		information_schema.constraint_column_usage ccu
-		ON c.table_name = ccu.table_name
-		AND c.column_name = ccu.column_name
-	LEFT JOIN information_schema.table_constraints tc ON
-		tc.table_catalog = c.table_catalog
-		AND tc.table_schema = c.table_schema
-		AND tc.table_name = c.table_name
-		AND tc.constraint_name = ccu.constraint_name
+		INFORMATION_SCHEMA.CONSTRAINT_COLUMN_USAGE ccu
+		ON c.TABLE_NAME = ccu.TABLE_NAME
+		AND c.COLUMN_NAME = ccu.COLUMN_NAME
+	LEFT JOIN INFORMATION_SCHEMA.TABLE_CONSTRAINTS tc ON
+		tc.TABLE_CATALOG = c.TABLE_CATALOG
+		AND tc.TABLE_SCHEMA = c.TABLE_SCHEMA
+		AND tc.TABLE_NAME = c.TABLE_NAME
+		AND tc.CONSTRAINT_NAME = ccu.CONSTRAINT_NAME
 	WHERE
-		c.table_schema = $1
+		c.TABLE_SCHEMA = @p1
 	ORDER BY
-		c.table_name,
-		c.ordinal_position
+		c.TABLE_NAME,
+		c.ORDINAL_POSITION
 	`, schemaName)
 	if err != nil {
 		log.Fatal(err)
@@ -298,6 +330,37 @@ func (db *MssqlDBRepository) DescribeDatabaseTableBySchema(ctx context.Context, 
 		tableInfos = append(tableInfos, &tableInfo)
 	}
 	return tableInfos, nil
+}
+
+func (db *MssqlDBRepository) DescribeForeignKeysBySchema(ctx context.Context, schemaName string) ([]*ForeignKey, error) {
+	rows, err := db.Conn.QueryContext(
+		ctx,
+		`
+		SELECT fk.name,
+		   src_tbl.name,
+		   src_col.name,
+		   dst_tbl.name,
+		   dst_col.name
+	FROM sys.foreign_key_columns fkc
+			 JOIN sys.objects fk on fk.object_id = fkc.constraint_object_id
+			 JOIN sys.tables src_tbl
+				  ON src_tbl.object_id = fkc.parent_object_id
+			 JOIN sys.schemas sch
+				  ON src_tbl.schema_id = sch.schema_id
+			 JOIN sys.columns src_col
+				  ON src_col.column_id = parent_column_id AND src_col.object_id = src_tbl.object_id
+			 JOIN sys.tables dst_tbl
+				  ON dst_tbl.object_id = fkc.referenced_object_id
+			 JOIN sys.columns dst_col
+				  ON dst_col.column_id = referenced_column_id AND dst_col.object_id = dst_tbl.object_id
+	where sch.name = @p1
+	order by fk.name, fkc.constraint_object_id
+		`, schemaName)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer func() { _ = rows.Close() }()
+	return parseForeignKeys(rows, schemaName)
 }
 
 func (db *MssqlDBRepository) Exec(ctx context.Context, query string) (sql.Result, error) {
@@ -329,7 +392,7 @@ func genMssqlConfig(connCfg *DBConfig) (string, error) {
 		}
 		q.Set("server", host)
 		q.Set("port", strconv.Itoa(port))
-	case ProtoUDP, ProtoUnix:
+	case ProtoUDP, ProtoUnix, ProtoHTTP:
 	default:
 		return "", fmt.Errorf("default addr for network %s unknown", connCfg.Proto)
 	}

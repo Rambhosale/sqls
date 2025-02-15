@@ -3,11 +3,11 @@ package config
 import (
 	"errors"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"os"
 	"path/filepath"
 
-	"github.com/lighttiger2505/sqls/internal/database"
+	"github.com/sqls-server/sqls/internal/database"
 	"gopkg.in/yaml.v2"
 )
 
@@ -16,7 +16,7 @@ var (
 )
 
 var (
-	ymlConfigPath = configFilePath("config.yml")
+	YamlConfigPath = configFilePath("config.yml")
 )
 
 type Config struct {
@@ -39,7 +39,7 @@ func NewConfig() *Config {
 
 func GetDefaultConfig() (*Config, error) {
 	cfg := NewConfig()
-	if err := cfg.Load(ymlConfigPath); err != nil {
+	if err := cfg.Load(YamlConfigPath); err != nil {
 		return nil, err
 	}
 	return cfg, nil
@@ -68,7 +68,7 @@ func (c *Config) Load(fp string) error {
 	}
 	defer file.Close()
 
-	b, err := ioutil.ReadAll(file)
+	b, err := io.ReadAll(file)
 	if err != nil {
 		return fmt.Errorf("cannot read config, %w", err)
 	}

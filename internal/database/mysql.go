@@ -4,11 +4,12 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"log"
 	"net"
 	"strconv"
 
 	"github.com/go-sql-driver/mysql"
-	"github.com/lighttiger2505/sqls/dialect"
+	"github.com/sqls-server/sqls/dialect"
 	"golang.org/x/crypto/ssh"
 )
 
@@ -115,6 +116,7 @@ func genMysqlConfig(connCfg *DBConfig) (*mysql.Config, error) {
 		}
 		cfg.Addr = connCfg.Path
 		cfg.Net = string(connCfg.Proto)
+  case ProtoHTTP:
 	default:
 		return nil, fmt.Errorf("default addr for network %s unknown", connCfg.Proto)
 	}
@@ -175,7 +177,7 @@ func (db *MySQLDBRepository) SchemaTables(ctx context.Context) (map[string][]str
 	rows, err := db.Conn.QueryContext(
 		ctx,
 		`
-	SELECT 
+	SELECT
 		TABLE_SCHEMA,
 		TABLE_NAME
 	FROM
@@ -300,6 +302,31 @@ WHERE information_schema.COLUMNS.TABLE_SCHEMA = ?
 		tableInfos = append(tableInfos, &tableInfo)
 	}
 	return tableInfos, nil
+}
+
+func (db *MySQLDBRepository) DescribeForeignKeysBySchema(ctx context.Context, schemaName string) ([]*ForeignKey, error) {
+	rows, err := db.Conn.QueryContext(
+		ctx,
+		`
+		select fks.CONSTRAINT_NAME,
+		   fks.TABLE_NAME,
+		   kcu.COLUMN_NAME,
+		   fks.REFERENCED_TABLE_NAME,
+		   kcu.REFERENCED_COLUMN_NAME
+	from INFORMATION_SCHEMA.REFERENTIAL_CONSTRAINTS fks
+			 join INFORMATION_SCHEMA.KEY_COLUMN_USAGE kcu
+				  on fks.CONSTRAINT_SCHEMA = kcu.TABLE_SCHEMA
+					  and fks.TABLE_NAME = kcu.TABLE_NAME
+					  and fks.CONSTRAINT_NAME = kcu.CONSTRAINT_NAME
+	where fks.CONSTRAINT_SCHEMA = ? and  kcu.REFERENCED_COLUMN_NAME is not null
+	order by fks.CONSTRAINT_NAME,
+			 kcu.ORDINAL_POSITION
+		`, schemaName)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer func() { _ = rows.Close() }()
+	return parseForeignKeys(rows, schemaName)
 }
 
 func (db *MySQLDBRepository) Exec(ctx context.Context, query string) (sql.Result, error) {
